@@ -27,7 +27,7 @@ readonly LOG_DEBUG=0
 readonly LOG_INFO=1
 readonly LOG_WARN=2
 readonly LOG_ERROR=3
-readonly LOG_LEVEL=${LOG_LEVEL:-$LOG_INFO}
+LOG_LEVEL=${LOG_LEVEL:-$LOG_INFO}
 
 # 兼容性 echo 函数
 cecho() {
@@ -156,20 +156,25 @@ validate_hex_format() {
     local hex_str=$1
     local allow_prefix=${2:-true}
     
+    # 去除所有空格以支持空格分隔的十六进制格式
+    local clean_hex=$(echo "$hex_str" | tr -d ' ')
+    
     if [ "$allow_prefix" = true ]; then
         # 允许带0x前缀
-        if ! [[ "$hex_str" =~ ^0x[0-9a-fA-F]+$ ]]; then
+        if ! [[ "$clean_hex" =~ ^0x[0-9a-fA-F]+$ ]] && ! [[ "$clean_hex" =~ ^[0-9a-fA-F]+$ ]]; then
             log $LOG_ERROR "无效的十六进制格式: $hex_str"
             return $ERROR_INVALID_PARAMS
         fi
     else
         # 不允许带前缀
-        if ! [[ "$hex_str" =~ ^[0-9a-fA-F]+$ ]]; then
+        if ! [[ "$clean_hex" =~ ^[0-9a-fA-F]+$ ]]; then
             log $LOG_ERROR "无效的十六进制格式: $hex_str"
             return $ERROR_INVALID_PARAMS
         fi
     fi
     
+    # 返回清理后的字符串
+    echo "$clean_hex"
     return 0
 }
 
@@ -812,27 +817,54 @@ decode_command() {
     cecho "$YELLOW" "=== 解码IPMI命令 ==="
     cecho "$GREEN" "输入: $hex_string"
     
-    # 安全地转换为数组并验证
+    # 简单处理：按空格分割字符串
     read -ra hex_array <<< "$hex_string"
+    
+    # 检查是否有足够的字节
     if [ ${#hex_array[@]} -lt 2 ]; then
         log $LOG_ERROR "十六进制字符串格式错误，至少需要2个字节"
         return $ERROR_INVALID_PARAMS
     fi
     
-    local netfn_lun="${hex_array[0]}"
-    local command_code="${hex_array[1]}"
+    # 为每个没有0x前缀的十六进制值添加0x前缀并确保格式正确
+    local formatted_array=()
+    for hex_val in "${hex_array[@]}"; do
+        # 使用validate_hex_format函数验证并获取清理后的格式
+        local clean_hex=$(validate_hex_format "$hex_val")
+        if [ $? -ne 0 ]; then
+            return $ERROR_INVALID_PARAMS
+        fi
+        
+        # 确保格式为0x前缀的标准格式
+        if ! [[ "$clean_hex" =~ ^0x ]]; then
+            clean_hex="0x$clean_hex"
+        fi
+        
+        # 确保是标准的两个字符表示（补零）
+        local hex_part=${clean_hex#0x}
+        if [ ${#hex_part} -lt 2 ]; then
+            hex_part="0${hex_part}"
+        elif [ ${#hex_part} -gt 2 ]; then
+            # 截取最后两个字符
+            hex_part="${hex_part: -2}"
+        fi
+        
+        formatted_array+=("0x$hex_part")
+    done
     
-    # 验证十六进制格式
-    validate_hex_format "$netfn_lun" || return $ERROR_INVALID_PARAMS
-    validate_hex_format "$command_code" || return $ERROR_INVALID_PARAMS
+    local netfn_lun="${formatted_array[0]}"
+    local command_code="${formatted_array[1]}"
     
     cecho "$BLUE" "基本信息:"
     echo "NetFn/LUN: $netfn_lun"
     echo "命令代码: $command_code"
     
-    # 命令识别
+    # 命令识别 - 使用转换为小写的格式以确保不区分大小写
     local command_name="unknown"
-    case "$netfn_lun $command_code" in
+    local lower_netfn_lun=$(echo "$netfn_lun" | tr '[:upper:]' '[:lower:]')
+    local lower_command_code=$(echo "$command_code" | tr '[:upper:]' '[:lower:]')
+    
+    case "$lower_netfn_lun $lower_command_code" in
         # 用户管理命令
         "0x06 0x45")
             command_name="user_set_name"
@@ -922,25 +954,36 @@ decode_command() {
     case "$command_name" in
         user_set_name)
             # 验证参数数量
-            if [ ${#hex_array[@]} -lt 5 ]; then
+            if [ ${#formatted_array[@]} -lt 5 ]; then
                 log $LOG_ERROR "用户设置命令格式不完整"
                 return $ERROR_INVALID_PARAMS
             fi
             
-            local user_id_hex="${hex_array[2]}"
+            local user_id_hex="${formatted_array[2]}"
+            # 验证十六进制格式
             validate_hex_format "$user_id_hex" || return $ERROR_INVALID_PARAMS
             
+            # 转换用户ID为十进制（处理0x前缀）
             local user_id=$((16#${user_id_hex#0x}))
             # 验证用户ID范围
             validate_number_range "$user_id" 1 255 "用户ID" || return $ERROR_RANGE
             
             cecho "$GREEN" "用户ID: $user_id ($user_id_hex)"
             
-            # 提取用户名（跳过第3个字节）
+            # 提取用户名（使用formatted_array以确保包含0x前缀）
             local username_hex=""
-            for ((i=4; i<${#hex_array[@]}; i++)); do
-                local byte="${hex_array[$i]}"
-                [ "$byte" = "0x00" ] && break  # 遇到0x00表示字符串结束
+            for ((i=4; i<${#formatted_array[@]}; i++)); do
+                local byte="${formatted_array[$i]}"
+                
+                # 验证十六进制格式
+                validate_hex_format "$byte" || return $ERROR_INVALID_PARAMS
+                
+                # 遇到0x00表示字符串结束
+                if [ "$byte" = "0x00" ]; then
+                    break
+                fi
+                
+                # 移除0x前缀以便连接
                 username_hex="$username_hex${byte#0x}"
             done
             
@@ -953,14 +996,14 @@ decode_command() {
             
         user_priv)
             # 验证参数数量
-            if [ ${#hex_array[@]} -lt 5 ]; then
+            if [ ${#formatted_array[@]} -lt 5 ]; then
                 log $LOG_ERROR "用户权限命令格式不完整"
                 return $ERROR_INVALID_PARAMS
             fi
             
-            local user_id_hex="${hex_array[2]}"
-            local priv_hex="${hex_array[3]}"
-            local channel_hex="${hex_array[4]}"
+            local user_id_hex="${formatted_array[2]}"
+            local priv_hex="${formatted_array[3]}"
+            local channel_hex="${formatted_array[4]}"
             
             # 验证所有十六进制参数
             validate_hex_format "$user_id_hex" || return $ERROR_INVALID_PARAMS
@@ -979,7 +1022,8 @@ decode_command() {
             
             # 权限识别
             local priv_name="未知"
-            case "$priv_hex" in
+            local lower_priv_hex=$(echo "$priv_hex" | tr '[:upper:]' '[:lower:]')
+            case "$lower_priv_hex" in
                 "0x01") priv_name="callback" ;;
                 "0x02") priv_name="user" ;;
                 "0x03") priv_name="operator" ;;
@@ -992,12 +1036,12 @@ decode_command() {
             
         power_on|power_off|power_reset)
             # 验证参数数量
-            if [ ${#hex_array[@]} -lt 3 ]; then
+            if [ ${#formatted_array[@]} -lt 3 ]; then
                 log $LOG_ERROR "电源命令格式不完整"
                 return $ERROR_INVALID_PARAMS
             fi
             
-            local delay_hex="${hex_array[2]}"
+            local delay_hex="${formatted_array[2]}"
             validate_hex_format "$delay_hex" || return $ERROR_INVALID_PARAMS
             
             local delay=$((16#${delay_hex#0x}))
@@ -1011,12 +1055,12 @@ decode_command() {
             
         user_set_password)
             # 验证参数数量
-            if [ ${#hex_array[@]} -lt 5 ]; then
+            if [ ${#formatted_array[@]} -lt 5 ]; then
                 log $LOG_ERROR "用户密码设置命令格式不完整"
                 return $ERROR_INVALID_PARAMS
             fi
             
-            local user_id_hex="${hex_array[2]}"
+            local user_id_hex="${formatted_array[2]}"
             validate_hex_format "$user_id_hex" || return $ERROR_INVALID_PARAMS
             
             local user_id=$((16#${user_id_hex#0x}))
@@ -1028,13 +1072,13 @@ decode_command() {
             
         user_enable_disable)
             # 验证参数数量
-            if [ ${#hex_array[@]} -lt 4 ]; then
+            if [ ${#formatted_array[@]} -lt 4 ]; then
                 log $LOG_ERROR "用户启用/禁用命令格式不完整"
                 return $ERROR_INVALID_PARAMS
             fi
             
-            local user_id_hex="${hex_array[2]}"
-            local enable_hex="${hex_array[3]}"
+            local user_id_hex="${formatted_array[2]}"
+            local enable_hex="${formatted_array[3]}"
             
             validate_hex_format "$user_id_hex" || return $ERROR_INVALID_PARAMS
             validate_hex_format "$enable_hex" || return $ERROR_INVALID_PARAMS
@@ -1054,22 +1098,25 @@ decode_command() {
             ;;
             
         sensor_read)
-            cecho "$GREEN" "传感器ID: ${hex_array[2]}"
-            if [ ${#hex_array[@]} -gt 3 ]; then
-                cecho "$GREEN" "传感器数据: ${hex_array[*]:3}"
+            cecho "$GREEN" "传感器ID: ${formatted_array[2]}"
+            if [ ${#formatted_array[@]} -gt 3 ]; then
+                cecho "$GREEN" "传感器数据: ${formatted_array[*]:3}"
             fi
             ;;
             
         sensor_set_threshold)
-            if [ ${#hex_array[@]} -ge 5 ]; then
-                cecho "$GREEN" "传感器ID: ${hex_array[2]}"
-                cecho "$GREEN" "阈值类型: ${hex_array[3]}"
-                cecho "$GREEN" "阈值: ${hex_array[4]}"
+            if [ ${#formatted_array[@]} -ge 5 ]; then
+                cecho "$GREEN" "传感器ID: ${formatted_array[2]}"
+                cecho "$GREEN" "阈值类型: ${formatted_array[3]}"
+                cecho "$GREEN" "阈值: ${formatted_array[4]}"
             fi
             ;;
             
         sel_list)
             cecho "$GREEN" "SEL日志列表查询命令"
+            if [ ${#formatted_array[@]} -gt 2 ]; then
+                cecho "$GREEN" "参数: ${formatted_array[*]:2}"
+            fi
             ;;
             
         sel_clear)
@@ -1078,13 +1125,13 @@ decode_command() {
             
         sel_add)
             cecho "$GREEN" "SEL事件添加命令"
-            if [ ${#hex_array[@]} -gt 3 ]; then
-                cecho "$GREEN" "事件数据: ${hex_array[*]:3}"
+            if [ ${#formatted_array[@]} -gt 3 ]; then
+                cecho "$GREEN" "事件数据: ${formatted_array[*]:3}"
             fi
             ;;
             
         fru_read)
-            cecho "$GREEN" "FRU设备ID: ${hex_array[2]}"
+            cecho "$GREEN" "FRU设备ID: ${formatted_array[2]}"
             ;;
             
         lan_print)
@@ -1092,12 +1139,12 @@ decode_command() {
             ;;
             
         lan_set)
-            if [ ${#hex_array[@]} -ge 4 ]; then
-                cecho "$GREEN" "通道: ${hex_array[2]}"
-                cecho "$GREEN" "配置类型: ${hex_array[3]}"
-                if [ ${#hex_array[@]} -ge 8 ]; then
+            if [ ${#formatted_array[@]} -ge 4 ]; then
+                cecho "$GREEN" "通道: ${formatted_array[2]}"
+                cecho "$GREEN" "配置类型: ${formatted_array[3]}"
+                if [ ${#formatted_array[@]} -ge 8 ]; then
                     # 解析IP地址
-                    local ip_parts=(${hex_array[@]:4:4})
+                    local ip_parts=(${formatted_array[@]:4:4})
                     local ip_str=""
                     for part in "${ip_parts[@]}"; do
                         local dec_val=$((16#${part#0x}))
@@ -1110,12 +1157,12 @@ decode_command() {
             ;;
             
         *)
-            cecho "$GREEN" "数据字节: ${hex_array[*]:2}"
+            cecho "$GREEN" "数据字节: ${formatted_array[*]:2}"
             # 显示原始字节的十进制值，方便调试
-            if [ ${#hex_array[@]} -gt 2 ]; then
+            if [ ${#formatted_array[@]} -gt 2 ]; then
                 local decimal_values=""
-                for ((i=2; i<${#hex_array[@]}; i++)); do
-                    local hex_byte="${hex_array[$i]}"
+                for ((i=2; i<${#formatted_array[@]}; i++)); do
+                    local hex_byte="${formatted_array[$i]}"
                     local dec_val=$((16#${hex_byte#0x}))
                     decimal_values="$decimal_values $dec_val"
                 done
@@ -1171,20 +1218,12 @@ main() {
     
     log $LOG_DEBUG "脚本启动，参数: $@"
     
-    if [ $# -lt 1 ]; then
-        log $LOG_WARN "未提供参数"
-        usage
-        exit $ERROR_INVALID_PARAMS
-    fi
-    
-    local mode=$1
-    shift
-    
-    # 新增: 执行模式选项
+    # 初始化解码标志和执行标志
     local execute_flag=false
     
-    # 处理全局选项
-    while [[ $1 == -* ]]; do
+    # 首先解析全局选项
+    local temp_args=()
+    while [[ $# -gt 0 ]]; do
         case "$1" in
             --execute|-x)
                 execute_flag=true
@@ -1200,12 +1239,24 @@ main() {
                 exit 0
                 ;;
             *)
-                log $LOG_ERROR "未知的选项: $1"
-                usage
-                exit $ERROR_INVALID_PARAMS
+                # 不是全局选项，保存到临时数组
+                temp_args+=("$1")
+                shift
                 ;;
         esac
     done
+    
+    # 恢复参数
+    set -- "${temp_args[@]}"
+    
+    if [ $# -lt 1 ]; then
+        log $LOG_WARN "未提供参数"
+        usage
+        exit $ERROR_INVALID_PARAMS
+    fi
+    
+    local mode=$1
+    shift
     
     case "$mode" in
         encode|e)
@@ -1236,7 +1287,7 @@ main() {
                     encode_user_priv "$1" "$2" "$3"
                     ;;
                 power_on|power_off|power_reset|power_status)
-                    encode_power_control "$command_type" "$1"
+                    encode_power_control "$command_type" "${2:-}"
                     ;;
                     
                 # 用户管理命令
