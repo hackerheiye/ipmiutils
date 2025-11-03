@@ -25,7 +25,7 @@
 
 ```bash
 # 1. 下载脚本
-curl -O https://github.com/hackerheiye/ipmiutils/blob/main/ipmiutils.sh
+curl -O https://example.com/ipmiutils.sh
 
 # 2. 设置执行权限
 chmod +x ipmiutils.sh
@@ -318,6 +318,12 @@ chmod +x ipmiutils.sh
 ### v1.1.0
 - 新增完整传感器类型支持
 - 增强错误处理和日志功能
+
+### v1.2.0
+- 修复电源控制命令参数传递问题
+- 增强十六进制格式处理，支持大小写不敏感匹配
+- 优化命令参数验证逻辑
+- 全面测试并确保所有命令正常工作
 
 ## 10. 许可证
 
